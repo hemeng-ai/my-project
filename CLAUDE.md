@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 收到用户开发需求后，按以下优先级判断：
 
-1. **新功能 / 架构变更 / 多文件改动** → 立即激活 `main-orchestrator`，走完整四阶段流水线
+1. **新功能 / 架构变更 / 多文件改动** → `Agent(subagent_type="main-orchestrator")` 走完整四阶段流水线
 2. **单文件 bug 修复 / 文案调整** → 简化流程：确认需求 → 派发 `fix-agent` → `review-agent` 审查
 3. **纯问答 / 解释说明** → 直接回答，不启动流水线
 
@@ -32,6 +32,18 @@ main-orchestrator (总指挥, 不写代码)
         └── Skill: superpowers:finishing-a-development-branch
 ```
 
+## Agent 速查
+
+| Agent | 模型 | 权限 | 触发条件 |
+|---|---|---|---|
+| `main-orchestrator` | 继承父会话 | 读写 + Skill + Agent | 新功能/架构变更/多文件改动 |
+| `test-agent` | sonnet | 读写 | 每个实施任务之前（TDD 红灯） |
+| `coding-agent` | sonnet | 读写 | test-agent 完成后 |
+| `review-agent` | opus | **只读** | 每个任务完成后，必须触发 |
+| `security-agent` | opus | **只读** | 涉及认证/输入/敏感数据/外部 API 时 |
+| `fix-agent` | sonnet | 读写 | review 发现问题或测试失败时（上限 2 轮） |
+| `docs-agent` | sonnet | 读写 | 所有审查通过后 |
+
 ## 关键设计约束
 
 - **隔离原则**：子 agent 之间通过 git commit/文件传递状态，禁止依赖会话上下文
@@ -43,28 +55,55 @@ main-orchestrator (总指挥, 不写代码)
 ## 项目结构
 
 ```
-.claude/agents/
-├── main-orchestrator/main-orchestrator.md
-├── coding-agent/coding-agent.md
-├── test-agent/test-agent.md
-├── review-agent/review-agent.md
-├── security-agent/security-agent.md
-├── fix-agent/fix-agent.md
-└── docs-agent/docs-agent.md
+.claude/
+├── settings.json          # hooks 配置（SessionStart + SessionEnd）
+├── hooks/
+│   ├── git-worktree-setup.ps1   # SessionStart: 自动创建隔离 worktree
+│   └── session-end.ps1          # SessionEnd: 自动提交 + 验证 + 清理
+└── agents/
+    ├── main-orchestrator/main-orchestrator.md
+    ├── coding-agent/coding-agent.md
+    ├── test-agent/test-agent.md
+    ├── review-agent/review-agent.md
+    ├── security-agent/security-agent.md
+    ├── fix-agent/fix-agent.md
+    └── docs-agent/docs-agent.md
 ```
 
-## 依赖的 Skills
+## Hooks 自动化
 
-本流水线依赖以下 Superpowers 技能（已通过插件安装）：
+| Hook | 触发时机 | 脚本 | 功能 |
+|---|---|---|---|
+| SessionStart | 会话启动 | `git-worktree-setup.ps1` | 自动创建隔离 worktree |
+| SessionEnd | 会话结束 | `session-end.ps1` | 自动提交 → lint/test 验证 → 清理已合并 worktree |
 
-- `superpowers:brainstorming` — 需求设计
-- `superpowers:writing-plans` — 编写实施计划
-- `superpowers:subagent-driven-development` — 子 agent 驱动执行
-- `superpowers:executing-plans` — 串行批量执行
-- `superpowers:dispatching-parallel-agents` — 并行任务分发
-- `superpowers:using-git-worktrees` — 隔离工作区
-- `superpowers:finishing-a-development-branch` — 分支收尾
-- `superpowers:verification-before-completion` — 完成前验证
+## 环境前提
+
+- **PowerShell ExecutionPolicy**：hooks 脚本需要 `RemoteSigned` 或 `Bypass` 级别
+  ```powershell
+  Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+  ```
+- **Git 版本**：`git worktree` 需要 Git 2.5+，`git worktree remove` 需要 Git 2.17+
+
+## 故障排查
+
+### Hooks 未触发
+1. 检查 PowerShell 执行策略：`Get-ExecutionPolicy`
+2. 确认 `.claude/settings.json` 是合法 JSON（语法错误会导致 hooks 被静默忽略）
+3. 手动运行脚本验证：
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File ".claude/hooks/git-worktree-setup.ps1"
+   powershell -ExecutionPolicy Bypass -File ".claude/hooks/session-end.ps1"
+   ```
+
+### Worktree 未创建
+- worktree 需要至少一个 commit；空仓库会自动跳过
+- 已在 worktree 中时不会重复创建
+- 在 main / master 分支上工作时不会创建隔离区
+
+### Agent 调用失败
+- 确保 agent 的 `.md` 文件中 `tools:` frontmatter 包含所需工具
+- review-agent 和 security-agent 只有只读工具，向其派发写操作会失败
 
 ## 对 Agent 文件的修改约定
 
