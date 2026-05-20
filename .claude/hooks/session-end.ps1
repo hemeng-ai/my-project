@@ -1,6 +1,6 @@
 # SessionEnd 自动化收尾脚本
 # 触发时机：Claude Code 会话结束时
-# 功能：自动提交 → 运行验证 → 清理 worktree → 输出摘要
+# 功能：自动提交 → 运行验证 → 清理 worktree → 重启 dev server → 输出摘要
 
 $ErrorActionPreference = "Continue"
 $projectRoot = $env:CLAUDE_PROJECT_DIR
@@ -22,7 +22,7 @@ if ($status) {
     $branch = git rev-parse --abbrev-ref HEAD 2>$null
     if (-not $branch) { $branch = "unknown" }
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $commitMsg = "会话结束自动提交 — $timestamp — $branch 分支"
+    $commitMsg = "chore: 会话结束自动提交 — $timestamp — $branch 分支"
 
     git commit -m $commitMsg 2>&1 | Out-Null
     if ($LASTEXITCODE -eq 0) {
@@ -113,7 +113,53 @@ if ($worktreeList) {
 }
 
 # ============================================================
-# Step 4: 输出摘要
+# Step 4: 杀掉旧 dev server + 重启
+# ============================================================
+Write-Output "[SessionEnd] 重启开发服务器..."
+
+$sipDir = Join-Path $projectRoot "sports-injury-platform"
+if (Test-Path $sipDir) {
+    # 杀掉占用 3000 端口的进程
+    $procId = (Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue).OwningProcess
+    if ($procId) {
+        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+        Write-Output "[SessionEnd] 已停止旧 dev server (PID: $procId)"
+        $summary += "[OK] 已停止旧 dev server"
+    }
+
+    # 后台启动新 dev server
+    $devLog = Join-Path $sipDir ".next\dev-server.log"
+    Start-Process powershell -ArgumentList "-NoProfile -WindowStyle Hidden -Command `"cd '$sipDir'; npx next dev --port 3000 *>&1 | Out-File '$devLog'`""
+    Write-Output "[SessionEnd] 新 dev server 已后台启动，等待就绪..."
+
+    # 等待服务就绪（最长 30 秒）
+    $ready = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Seconds 1
+        try {
+            $response = Invoke-WebRequest -Uri "http://localhost:3000" -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+            if ($response.StatusCode -eq 200 -or $response.StatusCode -eq 304) {
+                $ready = $true
+                break
+            }
+        } catch {
+            # 继续等待
+        }
+    }
+
+    if ($ready) {
+        $summary += "[OK] Dev server 已就绪: http://localhost:3000"
+        Write-Output "[SessionEnd] Dev server 就绪"
+    } else {
+        $summary += "[提示] Dev server 启动中，请稍后访问 http://localhost:3000"
+        Write-Output "[SessionEnd] Dev server 仍在启动中"
+    }
+} else {
+    $summary += "[跳过] 未找到 sports-injury-platform 目录"
+}
+
+# ============================================================
+# Step 5: 输出摘要
 # ============================================================
 Write-Output ""
 Write-Output "============================================"
@@ -122,4 +168,7 @@ Write-Output "============================================"
 foreach ($line in $summary) {
     Write-Output "  $line"
 }
+Write-Output "============================================"
+Write-Output ""
+Write-Output " 验证地址: http://localhost:3000"
 Write-Output "============================================"
