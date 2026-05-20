@@ -1,4 +1,19 @@
 {
+  "enabledMcpjsonServers": ["puppeteer"],
+  "permissions": {
+    "allow": [
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(node *)",
+      "Bash(git *)",
+      "Bash(npx jest *)",
+      "Bash(npx prisma *)",
+      "Bash(powershell *)"
+    ],
+    "additionalDirectories": [
+      "d:\\ClaudeWorkSpace\\my_project\\sports-injury-platform"
+    ]
+  },
   "hooks": {
     "SessionStart": [
       {

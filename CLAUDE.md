@@ -51,6 +51,7 @@ main-orchestrator (总指挥, 不写代码)
 - **权限最小化**：review-agent 和 security-agent 只有只读工具（Read, Grep, Glob, Bash）
 - **硬性门槛**：设计文档未获用户批准前，禁止派发任何实施任务
 - **修复上限**：fix-agent 最多 2 轮，超出后上报阻塞
+- **JWT 解密原则**：NextAuth v5 使用 JWE (A256CBC-HS512) 加密 session token，加密密钥通过 HKDF-SHA256 从 AUTH_SECRET 派生。**禁止自定义 HKDF 派生逻辑或直接传原始 secret 给 jwtDecrypt**，必须统一使用 `@auth/core/jwt` 的 `decode()` 函数。详见 `src/lib/session.ts` 顶部注释。
 
 ## 项目结构
 
