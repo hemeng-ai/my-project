@@ -67,9 +67,9 @@ tools: Skill, Agent, TaskCreate, TaskUpdate, Bash, Read, Write, Edit, Glob, Grep
       ↓
     coding-agent（最简实现，让测试通过）
       ↓
-    review-agent（spec 合规审查 → 代码质量审查）
+    security-agent（如触发条件满足，按需触发）
       ↓
-    security-agent（如触发条件满足）
+    review-agent（spec 合规审查 → 代码质量审查）
       ↓
     fix-agent（如发现问题，最多 2 轮修复）
       ↓
@@ -158,4 +158,5 @@ tools: Skill, Agent, TaskCreate, TaskUpdate, Bash, Read, Write, Edit, Glob, Grep
 | 并行执行 | `Skill(skill="superpowers:subagent-driven-development")` |
 | 超并行任务 | `Skill(skill="superpowers:dispatching-parallel-agents")` |
 | 分支隔离 | `Skill(skill="superpowers:using-git-worktrees")` |
+| 验证完成 | `Skill(skill="superpowers:verification-before-completion")` |
 | 完成分支 | `Skill(skill="superpowers:finishing-a-development-branch")` |
