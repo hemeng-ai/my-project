@@ -87,7 +87,7 @@ main-orchestrator (总指挥, 不写代码)
 
 这是两套不同的运行时，不要混淆：
 
-- **Python 编排器（`orchestrator.py` / `base_agent.py`）：** 只调用 DeepSeek API 并返回文本，不编辑项目文件、不运行测试。它的 `run_agent` 只是发一次独立的 API 请求，上下文完全隔离。不要声称它跑过测试，除非真的加了测试执行（本次 P0 范围外）。
+- **Python 编排器（`orchestrator.py` / `base_agent.py`）：** 只调用 DeepSeek API 并返回文本，不编辑项目文件。它的 `run_agent` 只是发一次独立的 API 请求，上下文完全隔离。测试运行现在由 `gates.py` 真正执行（P1：跑 pytest/jest/go test 并按结果做门禁），但代码修改仍只发生在 Claude Code 里。
 - **Claude Code 运行时：** agent 的 `.md` 文件里声明的 `tools:`（Read、Write、Edit、Bash 等）才真正生效，文件编辑、测试运行、git 操作都在这里发生。`review-agent` 和 `security-agent` 的只读约束也是靠这里的工具列表 enforcement 的，Python 编排器里没有工具可供执行。
 
 ## 关键设计约束
@@ -97,7 +97,27 @@ main-orchestrator (总指挥, 不写代码)
 - **权限最小化**：review-agent 和 security-agent 只有只读工具（Read, Grep, Glob, Bash）
 - **硬性门槛**：设计文档未获用户批准前，禁止派发任何实施任务
 - **修复上限**：fix-agent 最多 2 轮，修完必须重新审查，超出后上报阻塞
-- **JWT 解密原则**：NextAuth v5 使用 JWE (A256CBC-HS512) 加密 session token，加密密钥通过 HKDF-SHA256 从 AUTH_SECRET 派生。**禁止自定义 HKDF 派生逻辑或直接传原始 secret 给 jwtDecrypt**，必须统一使用 `@auth/core/jwt` 的 `decode()` 函数。详见 `src/lib/session.ts` 顶部注释。
+
+## P1：真实门禁、持久化、重试与成本、任务队列
+
+P0 只修了“裁决是不是真的拦得住”，P1 补的是“门禁是不是真的跑过”：
+
+- **真实门禁（`gates.py`）**：test-agent 之后跑测试，红灯必须失败且失败原因只能是“未实现”（断言 / NotImplementedError）；语法错误（SyntaxError）或环境错误（ModuleNotFoundError / ImportError）直接触发人工介入，不派 fix-agent 改测试。coding-agent 之后跑测试，必须全过，否则进 fix 循环；fix 之后重跑测试并做回归检查（新出现的失败会作为下一轮修复的输入）。lint 是 best-effort：没有配置 linter 时跳过，配置了但失败时记入日志并追加到审查上下文，不单独硬拦。git diff / git status 用于记录变更文件，也作为安全触发的输入之一。
+- **持久化与断点续跑**：每次运行写检查点 `.pipeline-state.json`（已完成的阶段、修复轮次、基线、上一阶段输出）和 JSONL 运行日志 `pipeline-run.log.jsonl`（每行一个阶段：时间、agent、模型、裁决、耗时、成本汇总）。`python orchestrator.py --resume '任务'` 会从检查点恢复，跳过已完成的阶段。这两个文件是本地运行状态，不要提交（已加入 `.gitignore`）。
+- **重试与成本（`base_agent.py`）**：DeepSeek API 调用失败时只对限流 / 超时 / 5xx 重试（指数退避，最多 3 次，单次超时 120 秒），401 等认证错误不重试。每次调用的 usage 会累加到 `COST_TRACKER`，成本按模型单价估算（默认值是估算，请按当前官方价目用环境变量覆盖）。预算由 `PIPELINE_MAX_COST_USD`（默认 5.0 美元）和 `PIPELINE_MAX_TOKENS`（默认 1,000,000）控制，超预算时不再发请求，直接转人工介入。
+- **任务队列与 WIP 上限**：`python orchestrator.py queue tasks.jsonl` 按序跑多个独立任务（JSONL，每行 `{"title": ..., "task": ...}`），一个任务失败不中断整队，结果写进 `tasks.jsonl.results.jsonl`。WIP 上限：coding-agent、review-agent、security-agent、main-orchestrator、docs-agent 同时最多 1 个，test-agent、fix-agent 最多 2 个。单任务内的 test → coding → review 必须串行；队列是按序跑的，不做多线程并行执行（多线程会打乱 git 状态和检查点），并行只体现在任务之间互不阻塞。
+
+## P2：结构化输出、安全触发、基线回滚
+
+- **结构化输出**：review-agent、security-agent、fix-agent、test-agent 的 `.md` 输出规范里都要求在末尾附一段机器可读的 JSON 块（格式见各自文件），与 `orchestrator.py` 的 `parse_verdict` 对应。人类可读的部分保留，JSON 块只做机器判断。
+- **安全触发（单一事实来源）**：触发类别定义在 `orchestrator.py` 的 `SECURITY_TRIGGERS` 里：auth（认证/登录/密码/token/权限）、input（用户输入/输入校验/文件上传）、sensitive_data（敏感数据/隐私/支付）、external_api（外部 API/第三方/webhook）。security-agent 只在触发类别命中任务文本或变更文件、或 review-agent 的裁决里 `needs_security_review` 为 true 时才跑；`CLAUDE.md` 和 `security-agent.md` 里的触发表与这份定义保持一致。
+- **基线与回滚**：coding-agent 运行前，流水线记录基线——当前 git HEAD SHA + 变更摘要——写进检查点。fix-agent 用满 2 轮仍失败、或测试回归时，失败报告里会附上基线 SHA。回滚方法是人工执行：`git stash` 或 `git checkout <基线 SHA> -- <相关文件>`，确认测试恢复后再重新派发任务。**不要无确认执行 `git reset --hard`**。
+
+## 项目专属规则（不属于通用流水线）
+
+以下规则只适用于 sports-injury-platform 项目，不要当成通用流水线规则用到别的项目上：
+
+- **JWT 解密原则（仅 sports-injury-platform）**：NextAuth v5 使用 JWE (A256CBC-HS512) 加密 session token，加密密钥通过 HKDF-SHA256 从 AUTH_SECRET 派生。**禁止自定义 HKDF 派生逻辑或直接传原始 secret 给 jwtDecrypt**，必须统一使用 `@auth/core/jwt` 的 `decode()` 函数。详见 `src/lib/session.ts` 顶部注释。
 
 ## 项目结构
 
@@ -105,8 +125,10 @@ main-orchestrator (总指挥, 不写代码)
 .claude/
 ├── settings.json          # hooks 配置（SessionStart + SessionEnd）
 ├── hooks/
-│   ├── git-worktree-setup.ps1   # SessionStart: 自动创建隔离 worktree
-│   └── session-end.ps1          # SessionEnd: 自动提交 + 验证 + 清理
+│   ├── git-worktree-setup.ps1   # Windows: SessionStart 自动创建隔离 worktree
+│   ├── git-worktree-setup.sh    # macOS/Linux/云端：同上（bash 版，见下）
+│   ├── session-end.ps1          # Windows: SessionEnd 自动提交 + 验证 + 清理
+│   └── session-end.sh           # macOS/Linux/云端：同上（bash 版，见下）
 └── agents/
     ├── main-orchestrator/main-orchestrator.md
     ├── coding-agent/coding-agent.md
@@ -117,20 +139,28 @@ main-orchestrator (总指挥, 不写代码)
     └── docs-agent/docs-agent.md
 ```
 
+新增文件：`gates.py`（真实门禁：跑测试 / lint / git diff）、`pipeline-run.log.jsonl` 与 `.pipeline-state.json`（本地运行状态，不提交）。
+
 ## Hooks 自动化
 
 | Hook | 触发时机 | 脚本 | 功能 |
 |---|---|---|---|
-| SessionStart | 会话启动 | `git-worktree-setup.ps1` | 自动创建隔离 worktree |
-| SessionEnd | 会话结束 | `session-end.ps1` | 自动提交 → lint/test 验证 → 清理已合并 worktree |
+| SessionStart | 会话启动 | `git-worktree-setup.ps1`（Windows）或 `git-worktree-setup.sh`（macOS/Linux/云端） | 自动创建隔离 worktree |
+| SessionEnd | 会话结束 | `session-end.ps1`（Windows）或 `session-end.sh`（macOS/Linux/云端） | 自动提交 → lint/test 验证 → 清理已合并 worktree |
+
+PowerShell 版是 Windows 专用的，bash 版是 macOS / Linux / 云端用的，两套做的是同一件事（创建隔离 worktree；结束时提交、验证、清理已合并的 worktree）。`settings.json` 里默认配的是 PowerShell 版；在 macOS / Linux / 云端使用时，把其中两条命令换成对应的 `bash .claude/hooks/*.sh` 即可（先 `chmod +x .claude/hooks/*.sh`）。注意：bash 版 session-end 不重启 dev server（那是 sports-injury-platform 在 Windows 上的专属行为），需要的话手动启动。
+
+`settings.json` 里不要写死本机路径。旧版里写死的 `d:\ClaudeWorkSpace\my_project\sports-injury-platform` 已删除；`additionalDirectories` 留空，需要额外目录时由每台机器自己在本地配置里加，不要提交进仓库。
 
 ## 环境前提
 
-- **PowerShell ExecutionPolicy**：hooks 脚本需要 `RemoteSigned` 或 `Bypass` 级别
+- **PowerShell ExecutionPolicy（仅 Windows）**：hooks 脚本需要 `RemoteSigned` 或 `Bypass` 级别
   ```powershell
   Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
   ```
+- **bash hooks（macOS / Linux / 云端）**：使用前先 `chmod +x .claude/hooks/*.sh`；`settings.json` 里把 PowerShell 命令换成 `bash .claude/hooks/git-worktree-setup.sh` / `bash .claude/hooks/session-end.sh`。
 - **Git 版本**：`git worktree` 需要 Git 2.5+，`git worktree remove` 需要 Git 2.17+
+- **Python 编排器**：需要 Python 3.10+ 和 `openai` 包（DeepSeek 兼容 OpenAI SDK），以及 `DEEPSEEK_API_KEY` 环境变量；预算可用 `PIPELINE_MAX_COST_USD` / `PIPELINE_MAX_TOKENS` 控制。
 
 ## 故障排查
 
@@ -147,6 +177,7 @@ main-orchestrator (总指挥, 不写代码)
 - worktree 需要至少一个 commit；空仓库会自动跳过
 - 已在 worktree 中时不会重复创建
 - 在 main / master 分支上工作时不会创建隔离区
+- git 不允许同一个分支同时检出在两个 worktree 里：当前分支已检出在主工作区时，`git worktree add <目录> <分支>` 会失败。bash 版 hook 遇到这种情况会回退为 detached worktree（指向当前 HEAD）并如实说明；原 PowerShell 版不检查退出码，失败时也会谎称“已就绪”，需要手动用 `git worktree list` 核对。
 
 ### Agent 调用失败
 - 确保 agent 的 `.md` 文件中 `tools:` frontmatter 包含所需工具

@@ -171,3 +171,14 @@ model: sonnet
 - 测试需要认证的接口前，必须先调用登录接口获取 session/token
 - 401 响应不代表服务器崩溃，代表缺少认证，不要重启服务器
 - 测试顺序：先跑不需要登录的接口 → 再登录 → 再跑需要认证的接口
+---
+
+## 机器可读结果（P2，必填）
+
+上面的人类可读报告保留。在报告末尾必须再附一段 JSON 结果块，供 orchestrator 的红灯门禁做机器判断：
+
+```json
+{"status": "red" | "blocked", "tests_written": 8, "tests_failing": 8, "failure_kind": "not-implemented" | "syntax" | "environment" | "other", "files_created": ["tests/test_auth_handler.py"]}
+```
+
+规则：`failure_kind` 必须如实写——只有失败原因全是“被测代码未实现”时才是 `not-implemented`；出现 SyntaxError 填 `syntax`，出现 ImportError / ModuleNotFoundError 填 `environment`。`status` 为 `red` 表示红灯有效；规格不足、环境有问题时填 `blocked`，不要硬写 `red`。

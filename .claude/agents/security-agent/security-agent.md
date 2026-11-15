@@ -183,3 +183,15 @@ OWASP 覆盖: {已检查的类别列表}
 - 依赖中存在已知高危 CVE 且无可用修复版本
 - 安全问题根因涉及架构设计层面（非单文件可修复）
 - 扫描范围内存在无法读取的加密或混淆文件
+
+---
+
+## 机器可读裁决（P2，必填）
+
+上面的人类可读报告保留。在报告末尾必须再附一段 JSON 裁决块，供 `orchestrator.py` 的 `parse_verdict` 做机器判断（不要只写自然语言结论）：
+
+```json
+{"verdict": "pass" | "fail", "critical": 0, "warning": 0, "needs_security_review": false, "issues": ["问题描述", "..."]}
+```
+
+规则：`critical` 是 CRITICAL 的个数，`warning` 是 HIGH 的个数（MEDIUM / LOW 不计入阻塞数，但要写进报告正文）；`critical > 0` 时 `verdict` 必须为 `fail`。没有这段 JSON 时 orchestrator 会按 FAIL 处理，不会进入下一阶段。

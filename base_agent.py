@@ -10,6 +10,7 @@ base_agent.py — 负责"怎么运行一个 agent"
 """
 
 import os
+import time
 import json
 from pathlib import Path
 from openai import OpenAI  # DeepSeek 兼容 OpenAI SDK
@@ -35,6 +36,102 @@ AGENT_MODEL_MAP = {
     "test-agent":        "deepseek-v4-flash", # 写测试
     "docs-agent":        "deepseek-v4-flash", # 写文档
 }
+
+# ── 用量 / 成本追踪（P1）─────────────────────────────────────
+# 每次 API 调用返回的 usage（prompt/completion tokens）会累加到
+# COST_TRACKER；成本按模型单价估算，单价默认值是估算值，请按当前
+# 官方价目用环境变量覆盖（见 _model_price）。预算由环境变量控制：
+#   PIPELINE_MAX_COST_USD（默认 5.0 美元）
+#   PIPELINE_MAX_TOKENS（默认 1_000_000 tokens）
+# 超预算时 run_agent 在调用前直接返回失败，不再烧钱；orchestrator
+# 会把这种情况转为人工介入。
+_MODEL_PRICE_USD_PER_MTOK = {
+    # (input, output)，单位：美元 / 百万 tokens。默认值是估算。
+    "deepseek-v4-pro": (2.0, 8.0),
+    "deepseek-v4-flash": (0.1, 0.4),
+    "deepseek-chat": (0.2, 0.8),
+}
+MAX_RETRY_ATTEMPTS = 3
+API_TIMEOUT_SECONDS = 120
+
+
+def _model_price(model):
+    import os as _os
+    key = model.replace("-", "_").upper()
+    inp = float(_os.getenv(f"PIPELINE_PRICE_{key}_INPUT", _MODEL_PRICE_USD_PER_MTOK.get(model, (0.0, 0.0))[0]))
+    out = float(_os.getenv(f"PIPELINE_PRICE_{key}_OUTPUT", _MODEL_PRICE_USD_PER_MTOK.get(model, (0.0, 0.0))[1]))
+    return inp, out
+
+
+def _budget_limits():
+    max_cost = float(os.getenv("PIPELINE_MAX_COST_USD", "5.0"))
+    max_tokens = int(os.getenv("PIPELINE_MAX_TOKENS", "1000000"))
+    return max_cost, max_tokens
+
+
+class CostTracker:
+    """累计用量与成本。只记数字，不记任何密钥或正文。"""
+
+    def __init__(self):
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.estimated_cost_usd = 0.0
+        self.calls = 0
+
+    def add(self, model, usage):
+        if not usage:
+            return 0.0
+        prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion = int(getattr(usage, "completion_tokens", 0) or 0)
+        inp_price, out_price = _model_price(model)
+        cost = prompt / 1_000_000 * inp_price + completion / 1_000_000 * out_price
+        self.prompt_tokens += prompt
+        self.completion_tokens += completion
+        self.estimated_cost_usd += cost
+        self.calls += 1
+        return cost
+
+    @property
+    def total_tokens(self):
+        return self.prompt_tokens + self.completion_tokens
+
+    def exceeded(self):
+        max_cost, max_tokens = _budget_limits()
+        return self.estimated_cost_usd > max_cost or self.total_tokens > max_tokens
+
+    def summary(self):
+        max_cost, max_tokens = _budget_limits()
+        return {
+            "calls": self.calls,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "estimated_cost_usd": round(self.estimated_cost_usd, 4),
+            "max_cost_usd": max_cost,
+            "max_tokens": max_tokens,
+            "exceeded": self.exceeded(),
+        }
+
+
+COST_TRACKER = CostTracker()
+
+
+def get_cost_summary():
+    return COST_TRACKER.summary()
+
+
+def reset_cost_tracker():
+    global COST_TRACKER
+    COST_TRACKER = CostTracker()
+
+
+_RETRYABLE_MARKERS = ("429", "rate_limit", "rate limit", "timeout", "timed out", "502", "503", "500", "overloaded")
+
+
+def _is_retryable(exc):
+    text = str(exc).lower()
+    return any(m in text for m in _RETRYABLE_MARKERS)
+
 
 # md 文件路径（相对于项目根目录）
 # 真实文件是嵌套的：.claude/agents/{name}/{name}.md
@@ -99,6 +196,7 @@ def run_agent(
             "model": 使用的模型,
             "response": agent 的回复文本,
             "success": True/False,   # 仅表示 API 调用成功，不表示质量审查通过。
+                                     # 重试最多 3 次（仅限流/超时/5xx），用量记入 COST_TRACKER。
                                      # 质量裁决见 orchestrator.py 的 parse_verdict，
                                      # review FAIL 会阻塞流水线。
             "error": 错误信息（仅在 success=False 时存在）
@@ -139,22 +237,65 @@ def run_agent(
         if model == "deepseek-v4-pro":
             extra_params["extra_body"] = {"thinking": {"type": "enabled", "reasoning_effort": "max"}}
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            system=system_prompt,
-            max_tokens=8192,       # 思考模式输出更长，调大一些
-            temperature=0.2,       # 低温度，输出更稳定
-            **extra_params
-        )
+        # 预算先行：超预算就不发请求，直接失败，由 orchestrator 转人工介入。
+        if COST_TRACKER.exceeded():
+            summary = COST_TRACKER.summary()
+            return {
+                "agent": agent_name,
+                "model": model,
+                "response": None,
+                "success": False,
+                "error": (
+                    "成本/用量预算已超限，不再调用 API："
+                    f"已用 {summary['total_tokens']} tokens / "
+                    f"约 ${summary['estimated_cost_usd']}（上限 "
+                    f"{summary['max_tokens']} tokens / ${summary['max_cost_usd']}）。"
+                    "请调高 PIPELINE_MAX_TOKENS / PIPELINE_MAX_COST_USD 后重试，或人工介入。"
+                ),
+                "usage": None,
+                "estimated_cost_usd": 0.0,
+            }
+
+        # 重试：只对限流 / 超时 / 5xx 类临时错误重试（指数退避，最多 3 次）。
+        # 4xx 认证/参数错误不重试，直接失败。
+        response = None
+        last_exc = None
+        for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    system=system_prompt,
+                    max_tokens=8192,       # 思考模式输出更长，调大一些
+                    temperature=0.2,       # 低温度，输出更稳定
+                    timeout=API_TIMEOUT_SECONDS,
+                    **extra_params
+                )
+                break
+            except Exception as exc:  # noqa: BLE001 - 需区分可重试与不可重试错误
+                last_exc = exc
+                if not _is_retryable(exc) or attempt == MAX_RETRY_ATTEMPTS:
+                    raise
+                time.sleep(2 ** (attempt - 1))
+        if response is None:
+            raise last_exc
 
         reply = response.choices[0].message.content
+        usage = getattr(response, "usage", None)
+        call_cost = COST_TRACKER.add(model, usage)
 
         return {
             "agent": agent_name,
             "model": model,
             "response": reply,
-            "success": True
+            "success": True,
+            "usage": {
+                "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0,
+                "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0,
+                "total_tokens": int(getattr(usage, "total_tokens", 0) or 0) if usage else 0,
+            } if usage else None,
+            "estimated_cost_usd": round(call_cost, 4),
+            "cost_summary": COST_TRACKER.summary(),
         }
 
     except FileNotFoundError as e:
