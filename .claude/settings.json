@@ -10,9 +10,7 @@
       "Bash(npx prisma *)",
       "Bash(powershell *)"
     ],
-    "additionalDirectories": [
-      "d:\\ClaudeWorkSpace\\my_project\\sports-injury-platform"
-    ]
+    "additionalDirectories": []
   },
   "hooks": {
     "SessionStart": [
