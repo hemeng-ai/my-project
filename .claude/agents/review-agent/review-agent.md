@@ -183,3 +183,15 @@ model: opus
 - 实现文件与任务描述中提供的文件列表不符
 - 第一阶段发现实现与规格存在根本性偏差，继续第二阶段意义不大
 - 发现计划外的文件被修改，超出本次任务范围
+
+---
+
+## 机器可读裁决（P2，必填）
+
+上面的人类可读报告保留。在报告末尾必须再附一段 JSON 裁决块，供 `orchestrator.py` 的 `parse_verdict` 做机器判断（不要只写自然语言结论）：
+
+```json
+{"verdict": "pass" | "fail", "critical": 0, "warning": 0, "needs_security_review": false, "issues": ["问题描述", "..."]}
+```
+
+规则：`critical` 是 CRITICAL 的个数，`warning` 是 WARNING 的个数；`critical > 0` 时 `verdict` 必须为 `fail`；`needs_security_review` 为 true 表示建议加跑 security-agent；`issues` 列出所有阻塞问题。没有这段 JSON 时 orchestrator 会按 FAIL 处理，不会进入下一阶段。

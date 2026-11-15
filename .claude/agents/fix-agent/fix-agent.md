@@ -167,3 +167,15 @@ git diff: {commit SHA 或文件列表}
 - 修复一个问题会导致其他原本通过的测试失败
 - 当前为第 2 轮修复且仍未解决问题
 - 发现问题根因在于设计规格本身存在矛盾
+
+---
+
+## 机器可读结果（P2，必填）
+
+上面的人类可读报告保留。在报告末尾必须再附一段 JSON 结果块，供 orchestrator 做机器判断：
+
+```json
+{"status": "fixed" | "blocked", "round": 1, "root_cause": "根本原因描述", "files_modified": ["src/a.py"], "tests_passing": 8, "tests_failing": 0, "issues_remaining": ["未解决的问题", "..."]}
+```
+
+规则：第 2 轮仍未解决、或无法确定唯一根本原因、或修复需要改禁止范围的文件时，`status` 必须为 `blocked`，`issues_remaining` 列出未解决项；不要把没修好的写成 `fixed`。`tests_passing` / `tests_failing` 是修复后实际跑测试的数字，不是估计。
