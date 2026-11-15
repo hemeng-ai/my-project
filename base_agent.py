@@ -3,6 +3,10 @@ base_agent.py — 负责"怎么运行一个 agent"
 
 每次调用都是独立的 API 请求，上下文完全隔离。
 只有 DeepSeek API，用不同模型区分强弱。
+
+注意：本文件只负责调用 DeepSeek API 并返回文本，不读写项目文件、
+不运行测试。真正的文件编辑和测试运行发生在 Claude Code 里
+（见 CLAUDE.md「运行时的区别」一节）。
 """
 
 import os
@@ -14,13 +18,18 @@ from openai import OpenAI  # DeepSeek 兼容 OpenAI SDK
 # deepseek-v4-pro   = 强模型，思考+判断类 agent，支持思考模式（reasoning_effort=max）
 # deepseek-v4-flash = 快模型，执行类 agent，速度快且便宜
 
+# 规范流水线（与 CLAUDE.md、orchestrator.py PIPELINE 保持一致，
+# 1 个编排器 + 6 个专业子 agent，共 7 个）：
+#   判断类 → Pro：main-orchestrator、review-agent、security-agent
+#   执行类 → Flash：test-agent、coding-agent、fix-agent、docs-agent
+# 已删除 reflect-agent：需求一致性验证并入 review-agent 的
+# 两阶段审查（spec 合规 + 代码质量），不再单独设一个 agent。
 AGENT_MODEL_MAP = {
-    # 前四个：判断/推理/审查 → deepseek-v4-pro
+    # 判断/推理/审查 → deepseek-v4-pro
     "main-orchestrator": "deepseek-v4-pro",   # 任务拆解和调度
-    "reflect-agent":     "deepseek-v4-pro",   # 需求一致性验证
-    "review-agent":      "deepseek-v4-pro",   # 代码质量审查
+    "review-agent":      "deepseek-v4-pro",   # 代码质量审查（两阶段）
     "security-agent":    "deepseek-v4-pro",   # 安全检查
-    # 后四个：执行/生成类 → deepseek-v4-flash
+    # 执行/生成类 → deepseek-v4-flash
     "coding-agent":      "deepseek-v4-flash", # 写代码
     "fix-agent":         "deepseek-v4-flash", # 修 bug
     "test-agent":        "deepseek-v4-flash", # 写测试
@@ -28,6 +37,7 @@ AGENT_MODEL_MAP = {
 }
 
 # md 文件路径（相对于项目根目录）
+# 真实文件是嵌套的：.claude/agents/{name}/{name}.md
 AGENTS_DIR = Path(".claude/agents")
 
 # ── DeepSeek 客户端 ───────────────────────────────────────
@@ -45,11 +55,17 @@ def get_client() -> OpenAI:
 
 # ── 读取 agent 的 md 文件 ─────────────────────────────────
 def load_agent_prompt(agent_name: str) -> str:
-    md_path = AGENTS_DIR / f"{agent_name}.md"
-    if not md_path.exists():
+    # 先试嵌套路径（仓库真实布局），再回退到扁平路径（兼容旧布局）。
+    nested_path = AGENTS_DIR / agent_name / f"{agent_name}.md"
+    flat_path = AGENTS_DIR / f"{agent_name}.md"
+    tried = [nested_path, flat_path]
+    md_path = next((p for p in tried if p.exists()), None)
+    if md_path is None:
         raise FileNotFoundError(
-            f"找不到 agent 文件：{md_path}\n"
-            f"请确认文件存在于 .claude/agents/{agent_name}.md"
+            f"找不到 agent 文件：{agent_name}\n"
+            f"已尝试的路径：\n"
+            + "\n".join(f"  - {p}" for p in tried)
+            + "\n请确认文件存在于 .claude/agents/{name}/{name}.md"
         )
     content = md_path.read_text(encoding="utf-8")
 
@@ -82,7 +98,9 @@ def run_agent(
             "agent": agent 名称,
             "model": 使用的模型,
             "response": agent 的回复文本,
-            "success": True/False,
+            "success": True/False,   # 仅表示 API 调用成功，不表示质量审查通过。
+                                     # 质量裁决见 orchestrator.py 的 parse_verdict，
+                                     # review FAIL 会阻塞流水线。
             "error": 错误信息（仅在 success=False 时存在）
         }
     """
@@ -110,7 +128,7 @@ def run_agent(
         else:
             full_message = user_message
 
-        # 如果有多轮历史，加入（用于反思循环等需要记忆的场景）
+        # 如果有多轮历史，加入（用于修复循环等需要记忆的场景）
         if conversation_history:
             messages.extend(conversation_history)
 
